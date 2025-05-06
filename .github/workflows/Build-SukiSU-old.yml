@@ -1,4 +1,4 @@
-name: 编译一加ACE5内核
+name: 编译一加ACE5内核old
 
 on:
   workflow_dispatch:
