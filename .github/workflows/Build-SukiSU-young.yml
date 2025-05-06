@@ -1,0 +1,343 @@
+name: 编译一加内核-young
+
+on:
+  workflow_dispatch:
+    inputs:
+      CPU:
+        description: "分支"
+        required: true
+        default: 'sm8650'
+      FEIL:
+        description: "配置文件"
+        required: true
+        default: 'oneplus_ace5'
+      CPUD:
+        description: "处理器代号"
+        required: true
+        default: 'pineapple'
+      ANDROID_VERSION:
+        description: "内核安卓版本"
+        required: true
+        default: 'android14'
+      KERNEL_VERSION:
+        description: "内核版本"
+        required: true
+        default: '6.1'
+      KERNEL_NAME:
+        description: "修改内核名称"
+        required: true
+        default: '-android14-11-o-g1132d864665d'
+      kernelsu_variant:
+        description: "选择 KSU"
+        required: true
+        type: choice
+        options:
+          - Kernel
+          - SukiSU
+        default: SukiSU
+      kernelsu_version:
+        description: "选择 KSU 版本"
+        required: true
+        type: choice
+        options:
+          - without ksu
+          - tag
+          - main
+        default: main
+      SUSFS_ENABLED:
+        description: "添加 SUSFS"
+        required: true
+        type: choice
+        options:
+          - 启用
+          - 忽略
+        default: 启用
+      VFS_patch_ENABLED:
+        description: "添加vfs补丁（新钩子）？"
+        required: true
+        type: choice
+        options:
+          - 启用
+          - 忽略
+        default: 启用
+  schedule:
+    - cron: '0 23 * * *'  # UTC时间23点（北京时间次日7点）
+
+env:
+  RETENTION_COUNT: 7  # 保留的发布版本数量
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 最大化建筑空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "ychenxuan"
+          git config --global user.email "3494167979@qq.com"
+
+      - name: 安装依赖项
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y python3 git curl
+
+      - name: 安装软件仓库工具
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: 初始化版本库并同步
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          CPU="sm8650"  # 默认值
+          FEIL="oneplus_ace5"  # 默认值
+          echo "CPU: ${{ github.event.inputs.CPU }}"
+          echo "FEIL: ${{ github.event.inputs.FEIL }}"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/$CPU -m $FEIL.xml --depth=1
+          repo sync
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          sed -i 's/ -dirty//g' kernel_platform/common/scripts/setlocalversion
+          sed -i 's/ -dirty//g' kernel_platform/msm-kernel/scripts/setlocalversion
+      
+      - name: KernelSU 和 SukiSU 版本
+        run: |
+          KERNELSU_VARIANT="${{ github.event.inputs.kernelsu_variant || 'SukiSU' }}"
+          KERNELSU_VERSION="${{ github.event.inputs.kernelsu_version || 'main' }}"
+          
+          if [[ "$KERNELSU_VARIANT" == "Official" || "$KERNELSU_VARIANT" == "SukiSU" ]]; then
+            if [[ "$KERNELSU_VERSION" == "tag" ]]; then
+              echo "BRANCH=-" >> $GITHUB_ENV
+            elif [[ "$KERNELSU_VERSION" == "main" ]]; then
+              echo "BRANCH=-s susfs-stable" >> $GITHUB_ENV
+            fi
+          fi
+
+          
+      - name: 添加 KernelSU-SukiSU
+        run: |
+          KERNELSU_VARIANT="${{ github.event.inputs.kernelsu_variant || 'SukiSU' }}"
+          if [[ "$KERNELSU_VARIANT" == "SukiSU" ]]; then
+            cd kernel_workspace/kernel_platform
+            curl -LSs "https://raw.githubusercontent.com/ShirkNeko/KernelSU/main/kernel/setup.sh" | bash ${{ env.BRANCH }}
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" 12516)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          fi
+
+      - name: 应用 SUSFS 修补程序 SukiSU
+        run: |
+          KERNELSU_VARIANT="${{ github.event.inputs.kernelsu_variant || 'SukiSU' }}"
+          SUSFS_ENABLED="${{ github.event.inputs.SUSFS_ENABLED || '启用' }}"
+          ANDROID_VERSION="${{ github.event.inputs.ANDROID_VERSION || 'android14' }}"
+          KERNEL_VERSION="${{ github.event.inputs.KERNEL_VERSION || '6.1' }}"
+          
+          if [[ "$KERNELSU_VARIANT" == "SukiSU" && "$SUSFS_ENABLED" == "启用" ]]; then
+            cd kernel_workspace
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-$ANDROID_VERSION-$KERNEL_VERSION
+            git clone https://github.com/ShirkNeko/SukiSU_patch.git
+            cd kernel_platform
+
+            # 复制SUSFS补丁
+            cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch ./common/
+            cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            # zram lz4kd
+            #cp -r ../SukiSU_patch/other/lz4k/include/linux/* ./common/include/linux
+            #cp -r ../SukiSU_patch/other/lz4k/lib/* ./common/lib
+            #cp -r ../SukiSU_patch/other/lz4k/crypto/* ./common/crypto
+
+
+
+            
+            echo "正在给内核打susfs补丁"
+            cd ./common
+            patch -p1 < 50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch || true
+            echo "完成"
+          fi
+
+      - name: 应用 Hide Stuff 修补程序
+        run: |
+          SUSFS_ENABLED="${{ github.event.inputs.SUSFS_ENABLED || '启用' }}"
+          
+          if [[ "$SUSFS_ENABLED" == "启用" ]]; then
+            cd kernel_workspace/kernel_platform/common
+            cp ../../SukiSU_patch/69_hide_stuff.patch ./
+            echo "正在打隐藏应用补丁"
+            patch -p1 -F 3 < 69_hide_stuff.patch
+          fi
+
+
+         
+      - name: 应用新的挂钩补丁
+        run: |
+          VFS_PATCH_ENABLED="${{ github.event.inputs.VFS_patch_ENABLED || '启用' }}"
+          
+          if [[ "$VFS_PATCH_ENABLED" == "启用" ]]; then
+            cd kernel_workspace/kernel_platform/common
+            cp ../../SukiSU_patch/hooks/new_hooks.patch ./
+            echo "正在打vfs补丁"
+            patch -p1 -F 3 < new_hooks.patch
+            echo "完成"
+          fi
+
+
+      - name: 添加 SUSFS 配置设置
+        run: |
+          cd kernel_workspace/kernel_platform
+          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+          VFS_PATCH_ENABLED="${{ github.event.inputs.VFS_patch_ENABLED || '启用' }}"
+          
+          if [[ "$VFS_PATCH_ENABLED" == "启用" ]]; then
+            echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          
+          # 添加SUSFS配置设置
+          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+          
+          #echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          #echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+          # Remove check_defconfig
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+
+
+      - name: 添加制作名称
+        run: |
+          cd kernel_workspace/kernel_platform
+          KERNEL_NAME="${{ github.event.inputs.KERNEL_NAME || '-android14-11-o-g1132d864665d' }}"
+          sed -i '$s|echo "\$res"|echo "'"$KERNEL_NAME"'"|' ./common/scripts/setlocalversion
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+
+  
+      - name: 构建内核
+        run: |
+          CPU="${{ github.event.inputs.CPU || 'sm8650' }}"
+          CPUD="${{ github.event.inputs.CPUD || 'pineapple' }}"
+          
+          if [[ "$CPU" == "sm8650" ]]; then
+            cd kernel_workspace
+            ./kernel_platform/build_with_bazel.py -t "$CPUD" gki
+          fi
+
+      - name: 后备构建内核
+        run: |
+          CPU="${{ github.event.inputs.CPU || 'sm8650' }}"
+          CPUD="${{ github.event.inputs.CPUD || 'pineapple' }}"
+          
+          if [[ "$CPU" != "sm8650" ]]; then
+            cd kernel_workspace
+            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh "$CPUD" gki
+          fi
+
+      - name: 制作 AnyKernel3
+        run: |
+          CPUD="${{ github.event.inputs.CPUD || 'pineapple' }}"
+          
+          git clone https://github.com/Kernel-SU/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cp kernel_workspace/kernel_platform/out/msm-kernel-$CPUD-gki/dist/Image ./AnyKernel3/
+          cp kernel_workspace/kernel_platform/out/msm-kernel-$CPUD-gki/dist/Image ./kernel_workspace/init_boot.img
+
+      - name: 打包 AnyKernel3 (ZIP)
+        run: |
+          FEIL="${{ github.event.inputs.FEIL || 'oneplus_ace5' }}"
+          cd AnyKernel3
+          zip -r ../AnyKernel3_KernelSU_${{ env.KSUVER }}_$FEIL.zip ./*
+          cd ..
+
+
+      - name: 打包原始镜像 (ZIP)
+        run: |
+          FEIL="${{ github.event.inputs.FEIL || 'oneplus_ace5' }}"
+          zip -r Image_KernelSU_${{ env.KSUVER }}_$FEIL.zip ./kernel_workspace/init_boot.img
+
+      - name: 上传 ZIP 工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_ZIP_Artifacts
+          path: |
+            *.zip
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      
+    steps:
+      - name: 下载 ZIP 工件
+        uses: actions/download-artifact@v4
+        with:
+          name: Kernel_ZIP_Artifacts
+          path: ./release_zips
+         
+      - name: 创建发布
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "build-${{ github.run_id }}"
+          name: "OnePlus_ACE5 Build ${{ github.run_number }}"
+          body: |
+            每日自动编译一加系列 SukiSU_MKSU_SUSFS_VFS 内核
+            - 机型： 一加ACE5
+            - (修改Build-SukiSU.yml文件可更换机型)
+            - 编译时间: ${{ github.event.repository.updated_at }}
+            - 推荐管理器：[SukiSU](https://github.com/ShirkNeko/KernelSU/releases)
+            - 如果构建的内核版本没变，不必更新！
+            - AnyKernel3文件使用 AnyKernel3/Recovery/TWRP 刷入
+            - Image文件解压后使用 Fastboot 刷入
+          draft: false
+          prerelease: false
+          files: |
+            release_zips/AnyKernel3_KernelSU_*.zip
+            release_zips/Image_KernelSU_*.zip
+
+
+
+
+      - name: 清理旧版本
+        uses: dev-drprasad/delete-older-releases@v0.3.4
+        continue-on-error: true  # 允许步骤失败
+        timeout-minutes: 5       # 防止卡死
+        with:
+          keep_latest: ${{ env.RETENTION_COUNT }}
+          delete_tags: true
+          delete_tag_pattern: 'build-*'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
