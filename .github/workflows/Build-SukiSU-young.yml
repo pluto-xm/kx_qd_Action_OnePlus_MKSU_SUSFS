@@ -313,7 +313,7 @@ jobs:
           tag_name: "build-${{ github.run_id }}"
           name: "OnePlus_ACE5 Build ${{ github.run_number }}"
           body: |
-            每日自动编译一加系列 SukiSU_MKSU_SUSFS_VFS 内核
+            每日自动编译一加系列 SukiSU_MKSU_SUSFS_VFS 内核young
             - 机型： 一加ACE5
             - (修改Build-SukiSU.yml文件可更换机型)
             - 编译时间: ${{ github.event.repository.updated_at }}
